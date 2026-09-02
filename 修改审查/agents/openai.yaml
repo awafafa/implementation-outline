@@ -1,0 +1,4 @@
+﻿interface:
+  display_name: "修改审查"
+  short_description: "Verify diff-based incremental changes against user authorization"
+  default_prompt: "Use $xiu-gai-shen-cha for code structure diagram tasks."
