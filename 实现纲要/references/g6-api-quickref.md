@@ -6,7 +6,11 @@
 
 **数据文件结构：** `.data.js` 定义 `function 执行工作数据() { const api = 实现纲要; ... }`，HTML 自动加载并执行此函数。
 
-**完整实现：** 所有 API 的源码和 JSDoc 注释在 `templates/engine-v3.js` 中。
+**完整实现：** 所有 API 的源码和 JSDoc 注释在引擎文件
+`C:/Users/QWERTYUIOP/.agents/skills/实现纲要/templates/engine-v3.js` 中（**唯一权威副本**）。
+
+> ⚠️ 判断 API 行为时**只读上面这个绝对路径**。工作目录（或任何其它位置）里若也存在同名
+> `engine-v3.js`，那是历史副本，可能停留在旧版本，**不要用它来判断 API**。
 
 ---
 
