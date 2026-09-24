@@ -10,7 +10,7 @@
  *  - 节点类型枚举、边类型枚举、阶段枚举
  *  - 添加节点() 返回节点代理，支持链式调用
  *  - 添加变量() 统一字段声明
- *  - 添加测试() 属性方式，不创建独立节点
+ *  - 添加测试() 存入全局测试表（多对多：一条测试可依附 0..N 个节点）
  *  - 导出全景图() 完整 JSON 导出
  *
  *  AntV G6 v5 参考：https://g6.antv.antgroup.com/
@@ -441,7 +441,177 @@ const 数据仓库 = {
   节点约束: new Map(),
   责任映射: new Map(),
   分组: new Map(), // 组名 -> Set<节点id>
+  测试项: new Map(), // 测试id -> { id, 标题, 覆盖: [节点id...] }（覆盖为空数组 = 独立测试）
 };
+
+// ==================== 测试项（多对多：0..N 个节点） ====================
+// 一条测试项可覆盖 0 个节点（独立测试）、1 个节点，或任意多个节点。
+// 旧数据兼容：节点上遗留的 _测试项 数组仍会被 获取节点测试项() 合并读出。
+let 测试项计数器 = 0;
+
+/** 创建一条测试项。覆盖 可为 null / 单个节点id / 节点id数组。返回 测试项id。 */
+function 创建测试项(标题, 覆盖) {
+  const 原始 = (覆盖 === undefined || 覆盖 === null) ? []
+    : (Array.isArray(覆盖) ? 覆盖 : [覆盖]);
+  const 规范化 = [];
+  for (const 目标 of 原始) {
+    let 目标id = 目标;
+    try { 目标id = 解析节点ID(目标); } catch (e) { 目标id = null; }
+    if (目标id && 数据仓库.节点.has(目标id) && !规范化.includes(目标id)) 规范化.push(目标id);
+  }
+  const id = '测试' + (++测试项计数器);
+  数据仓库.测试项.set(id, { id: id, 标题: String(标题), 覆盖: 规范化 });
+  return id;
+}
+
+/** 某节点相关的全部测试项（覆盖集合包含该节点）。合并旧版 节点._测试项 数组。 */
+function 获取节点测试项(节点id) {
+  const 结果 = [];
+  for (const 项 of 数据仓库.测试项.values()) {
+    if (项.覆盖 && 项.覆盖.indexOf(节点id) >= 0) 结果.push(项);
+  }
+  const 遗留 = (数据仓库.节点.get(节点id) || {})._测试项 || [];
+  for (const t of 遗留) {
+    const 标题 = (typeof t === 'string') ? t : (t && t.标题);
+    if (标题 && !结果.some(x => x.标题 === 标题)) {
+      结果.push({ id: null, 标题: 标题, 覆盖: [节点id], 遗留: true });
+    }
+  }
+  return 结果;
+}
+
+/** 不依附任何节点的独立测试项 */
+function 获取独立测试项() {
+  const 结果 = [];
+  for (const 项 of 数据仓库.测试项.values()) {
+    if (!项.覆盖 || 项.覆盖.length === 0) 结果.push(项);
+  }
+  return 结果;
+}
+
+/** 测试项的导出形状：始终为 { id, 标题, 覆盖[] }（一对多：覆盖 0..N 个节点）。 */
+function 序列化测试项(项) {
+  return { id: 项.id || null, 标题: 项.标题, 覆盖: (项.覆盖 || []).slice() };
+}
+
+/** 全部测试项（导出用，统一一对多形状）。 */
+function 获取全部测试项() {
+  return Array.from(数据仓库.测试项.values()).map(序列化测试项);
+}
+
+// ==================== 测试执行序列（就绪驱动，非批次） ====================
+// 语义（用户定义）：一个节点的测试，必须等它依赖的节点全部测完才能跑；
+//   最底层、无依赖的节点，测试可立即运行，且彼此并行、互不干扰。
+//   全部自动推导，AI 与用户都不需要额外输入 —— 视图纯展示用。
+
+/** 节点 -> 它指向的节点数组（出边目标，去重，只保留存在的节点） */
+function 计算节点前置表() {
+  const 表 = new Map();
+  for (const 边数组 of 数据仓库.边.values()) {
+    for (const e of 边数组) {
+      const s = e.source, t = e.target;
+      if (!s || !t || s === t) continue;
+      if (!数据仓库.节点.has(s) || !数据仓库.节点.has(t)) continue;
+      if (!表.has(s)) 表.set(s, []);
+      if (表.get(s).indexOf(t) < 0) 表.get(s).push(t);
+    }
+  }
+  return 表;
+}
+
+/**
+ * 计算节点「就绪层级」：层级 0 = 无任何出边（最底层）；
+ * 层级 N = 1 + max(它所指向节点的层级)。带环保护。
+ */
+function 计算节点就绪层级() {
+  const 前置表 = 计算节点前置表();
+  const 层级 = new Map();
+  const 计算中 = new Set();
+  function 取(id) {
+    if (层级.has(id)) return 层级.get(id);
+    if (计算中.has(id)) return 0;   // 环保护
+    计算中.add(id);
+    let v = 0;
+    const ps = 前置表.get(id) || [];
+    for (const p of ps) {
+      const c = 取(p) + 1;
+      if (c > v) v = c;
+    }
+    计算中.delete(id);
+    层级.set(id, v);
+    return v;
+  }
+  for (const id of 数据仓库.节点.keys()) 取(id);
+  return 层级;
+}
+
+/**
+ * 计算测试项的执行序列。
+ *   就绪层级 = max(依附节点的层级)；依附 ≥2 个节点时 +1（联合测试等各方就绪）
+ *   不依附任何节点 = 独立测试，排在最后
+ *   同层级内：依附少的优先（局部测试先于联合测试）
+ */
+function 计算测试执行序列() {
+  const 层级 = 计算节点就绪层级();
+  const 前置表 = 计算节点前置表();
+  const 结果 = [];
+  for (const 项 of 数据仓库.测试项.values()) {
+    const 依附 = (项.覆盖 || []).filter(id => 数据仓库.节点.has(id));
+    const 独立 = 依附.length === 0;
+    let lv = 0;
+    const 等谁 = new Set();
+    for (const id of 依附) {
+      const l = 层级.get(id) || 0;
+      if (l > lv) lv = l;
+      (前置表.get(id) || []).forEach(p => 等谁.add(p));
+    }
+    if (依附.length >= 2) lv += 1;   // 联合测试
+    结果.push({ 测试项: 项, 层级: lv, 独立: 独立, 依附: 依附, 等谁: Array.from(等谁) });
+  }
+  结果.sort((a, b) => {
+    if (a.独立 !== b.独立) return a.独立 ? 1 : -1;
+    if (a.层级 !== b.层级) return a.层级 - b.层级;
+    if (a.依附.length !== b.依附.length) return a.依附.length - b.依附.length;
+    return String(a.测试项.id).localeCompare(String(b.测试项.id));
+  });
+  结果.forEach((r, i) => { r.序号 = i + 1; });
+  return 结果;
+}
+
+/** 测试规划视图：把执行序列渲染成面板区块 HTML（纯展示，不参与任何计算） */
+function 渲染测试执行序列() {
+  const 序列 = 计算测试执行序列();
+  if (!序列.length) return '';
+  const 短 = (id) => { const t = String(id || ''); const i = t.lastIndexOf('.'); return i >= 0 ? t.slice(i + 1) : t; };
+  let html = '';
+  html += '<div class="type-accordion" data-test-sequence="1">';
+  html += '<div class="type-accordion-header" onclick="this.parentElement.classList.toggle(\'open\')">';
+  html += '<span class="type-accordion-name">▶ <span>🧪 测试执行序列</span> <span style="font-size:9px;padding:1px 5px;border-radius:3px;margin-left:4px;background:#eef3fb;color:#1d6fb8;border:1px solid #1d6fb8">按依赖推导</span></span>';
+  html += '<span style="font-size:13px;color:var(--text-secondary);text-align:right">' + 序列.length + ' 项</span>';
+  html += '</div>';
+  html += '<div class="type-accordion-body">';
+  html += '<div class="type-detail-section"><h5>执行顺序</h5>';
+  html += '<table class="type-detail-table" style="table-layout:fixed"><tr><th style="width:30px">#</th><th>测试</th><th style="width:40%">依附 / 等谁</th></tr>';
+  let 当前键 = null;
+  for (const r of 序列) {
+    const 键 = r.独立 ? 'ind' : r.层级;
+    if (键 !== 当前键) {
+      当前键 = 键;
+      let 标签;
+      if (r.独立) 标签 = '独立测试 · 不参与自动排序';
+      else if (r.层级 === 0) 标签 = '就绪层级 1 · 无前置，可并行';
+      else 标签 = '就绪层级 ' + (r.层级 + 1) + ' · 等前置完成';
+      html += '<tr><td colspan="3" style="font-size:11px;color:var(--text-muted);background:var(--surface-hover);padding:3px 6px">' + 标签 + '</td></tr>';
+    }
+    const 依附文本 = r.依附.length ? r.依附.map(短).join('、') : '—';
+    const 等谁文本 = r.独立 ? '—' : (r.等谁.length ? '等 ' + r.等谁.map(短).join('、') : '无前置');
+    const 联合 = r.依附.length >= 2 ? ' <span style="font-size:10px;color:#1d6fb8">联合</span>' : '';
+    html += '<tr><td style="font-size:11px">' + r.序号 + '</td><td style="font-size:12px">' + r.测试项.标题 + 联合 + '</td><td style="font-size:10px;color:var(--text-muted);line-height:1.4">' + 依附文本 + '<br>' + 等谁文本 + '</td></tr>';
+  }
+  html += '</table></div>';
+  html += '</div></div>';
+  return html;
+}
 
 // 视图模式：'普通' | '测试规划'
 // 测试规划视图：突出显示测试项，节点上显示测试数量角标
@@ -621,7 +791,8 @@ const 图 = new Graph({
           return '📦 ' + (d.名称 || d.id) + ' (' + (d.成员数 || 0) + ')';
         }
         const 原始 = 数据仓库.节点.get(d.id);
-        let text = 原始?.名称 || d.id; const conf = d.confidence || "中"; const confDot = { 高: "🟢", 中: "🟡", 低: "🔴" }[conf] || "🟡"; text = confDot + " " + text;
+        // 优先使用传入的 d.名称（视图层可能已加工：层级标记、测试角标等），回退到数据仓库原名
+        let text = d.名称 || 原始?.名称 || d.id; const conf = d.confidence || "中"; const confDot = { 高: "🟢", 中: "🟡", 低: "🔴" }[conf] || "🟡"; text = confDot + " " + text;
         // type tags removed per user request
         // typeTag removed
         // 枚举值不在画布上显示（避免长文本），在右侧面板展开详情中查看
@@ -1597,9 +1768,11 @@ function 计算可见元素() {
       if ((原始?.类型 === 'variable' || 原始?.类型 === 'membervar') && 原始?.类型名) {
         显示名称 = `${原始.类型名} ${显示名称}`;
       }
-      const 测试数量 = 原始?._测试项?.length || 0;
-      if (测试数量 > 0) {
-        显示名称 = 显示名称 + `  🧪${测试数量}`;
+      if (当前视图模式 === '测试规划') {
+        const 测试数量 = 获取节点测试项(n.id).length;
+        if (测试数量 > 0) {
+          显示名称 = 显示名称 + `  🧪${测试数量}`;
+        }
       }
       return { ...n, 名称: 显示名称, nodeType: 原始?.类型 || 'class', confidence: 置信度, states };
     });
@@ -1691,9 +1864,11 @@ function 计算可见元素() {
     if ((原始?.类型 === 'variable' || 原始?.类型 === 'membervar') && 原始?.类型名) {
       显示名称 = `${原始.类型名} ${显示名称}`;
     }
-    const 测试数量 = 原始?._测试项?.length || 0;
-    if (测试数量 > 0) {
-      显示名称 = 显示名称 + `  🧪${测试数量}`;
+    if (当前视图模式 === '测试规划') {
+      const 测试数量 = 获取节点测试项(n.id).length;
+      if (测试数量 > 0) {
+        显示名称 = 显示名称 + `  🧪${测试数量}`;
+      }
     }
     return { ...n, 名称: 显示名称, nodeType: 原始?.类型 || 'class', confidence: 置信度, states };
   });
@@ -2094,8 +2269,7 @@ function 刷新类型面板() {
     显示节点 = 所有节点.filter(n => 节点分类.get(n.id) === '枚举');
   } else if (面板过滤 === '测试') {
     显示节点 = 所有节点.filter(n => {
-      const 测试项 = (数据仓库.节点.get(n.id) || {})._测试项 || [];
-      return 测试项.length > 0;
+      return 获取节点测试项(n.id).length > 0;
     });
   }
 
@@ -2150,6 +2324,28 @@ function 刷新类型面板() {
   const 面板宽 = 类型面板.getBoundingClientRect().width;
 
   let html = '';
+
+  // 测试规划视图：测试执行序列（按依赖就绪自动推导，纯展示）
+  if (当前视图模式 === '测试规划') {
+    html += 渲染测试执行序列();
+  }
+
+  // 独立测试区块：不依附任何节点的测试项
+  // 仅在测试规划视图下显示 —— 普通视图的「节点列表」里不应混入测试项（避免被误认成节点）
+  const 独立测试列表 = 获取独立测试项();
+  if (独立测试列表.length > 0 && 当前视图模式 === '测试规划') {
+    html += `<div class="type-accordion" data-standalone-tests="1">`;
+    html += `<div class="type-accordion-header" onclick="this.parentElement.classList.toggle(\'open\')">`;
+    html += `<span class="type-accordion-name">▶ <span>🧪 独立测试</span> <span style="font-size:9px;padding:1px 5px;border-radius:3px;margin-left:4px;background:#eef7ee;color:#2e7d32;border:1px solid #2e7d32">未依附节点</span></span>`;
+    html += `<span style="font-size:13px;color:var(--text-secondary);text-align:right">${独立测试列表.length} 条</span>`;
+    html += `</div>`;
+    html += `<div class="type-accordion-body">`;
+    html += '<div class="type-detail-section"><h5>🧪 测试项</h5>';
+    html += '<table class="type-detail-table"><tr><th>测试标题</th></tr>';
+    独立测试列表.forEach(t => { html += `<tr><td>• ${t.标题}</td></tr>`; });
+    html += '</table></div>';
+    html += `</div></div>`;
+  }
 
   // 渲染组条目（显示在列表顶部）
   if (显示组 && 数据仓库.分组.size > 0) {
@@ -2238,7 +2434,7 @@ function 渲染节点条目(节点数据, 面板宽) {
   const 成员函数列表 = 数据仓库.节点成员函数.get(id) || [];
   const 成员变量列表 = 数据仓库.节点成员变量.get(id) || [];
   const 约束列表 = 数据仓库.节点约束.get(id) || [];
-  const 测试列表 = (数据仓库.节点.get(id) || {})._测试项 || [];
+  const 测试列表 = 获取节点测试项(id);
   const 责任 = 数据仓库.责任映射.get(id);
   const 置信度级别 = 节点数据.置信度 === '高' ? 'high' : 节点数据.置信度 === '低' ? 'low' : 'med';
 
@@ -2350,12 +2546,19 @@ function 渲染节点条目(节点数据, 面板宽) {
     html += `</div>`;
   }
 
-  // 测试项板块
+  // 测试项板块：一条测试可覆盖多个节点，此处列出覆盖到本节点的全部测试
   html += `<div class="type-detail-section"><h5>🧪 测试项 (${测试列表.length})</h5>`;
   if (测试列表.length > 0) {
-    html += `<table class="type-detail-table"><tr><th>测试标题</th></tr>`;
+    html += `<table class="type-detail-table"><tr><th>测试标题</th><th>覆盖</th></tr>`;
     测试列表.forEach(t => {
-      html += `<tr><td>• ${t.标题}</td></tr>`;
+      const 覆盖数 = (t.覆盖 || []).length;
+      let 覆盖标记 = '';
+      if (覆盖数 > 1) {
+        覆盖标记 = `<span style="font-size:10px;color:var(--text-muted);cursor:help" title="${(t.覆盖 || []).join('、')}">🔗 ${覆盖数} 个节点</span>`;
+      } else if (覆盖数 === 0) {
+        覆盖标记 = '<span style="font-size:10px;color:var(--text-muted)">独立</span>';
+      }
+      html += `<tr><td>• ${t.标题}</td><td>${覆盖标记}</td></tr>`;
     });
     html += `</table>`;
   } else {
@@ -2652,7 +2855,7 @@ function 显示内联浮层(节点id, clientX, clientY) {
   const 成员函数列表 = 数据仓库.节点成员函数.get(节点id) || [];
   const 成员变量列表 = 数据仓库.节点成员变量.get(节点id) || [];
   const 约束列表 = 数据仓库.节点约束.get(节点id) || [];
-  const 测试列表 = 节点数据._测试项 || [];
+  const 测试列表 = 获取节点测试项(节点id);
   const 责任 = 数据仓库.责任映射.get(节点id);
   const 置信度级别 = 节点数据.置信度 === '高' ? 'high' : 节点数据.置信度 === '低' ? 'low' : 'med';
   const 签名 = 节点数据.签名 || '';
@@ -2676,11 +2879,15 @@ function 显示内联浮层(节点id, clientX, clientY) {
     成员变量列表.forEach(v => html += `<tr><td><strong>${v.变量名}</strong></td><td>${v.类型 || '—'}</td><td>${解析富文本(v.职责)}</td></tr>`);
     html += '</table>';
   }
-  // 测试项板块：与右侧面板保持一致
+  // 测试项板块：与右侧面板保持一致（一条测试可覆盖多个节点）
   if (测试列表.length > 0) {
     html += `<div style="margin-top:4px"><div style="font-size:11px;color:var(--text-muted);margin-bottom:2px">🧪 测试项 (${测试列表.length})</div>`;
-    html += '<table class="type-detail-table"><tr><th>测试标题</th></tr>';
-    测试列表.forEach(t => html += `<tr><td>• ${t.标题}</td></tr>`);
+    html += '<table class="type-detail-table"><tr><th>测试标题</th><th>覆盖</th></tr>';
+    测试列表.forEach(t => {
+      const 覆盖数 = (t.覆盖 || []).length;
+      const 覆盖标记 = 覆盖数 > 1 ? `<span style="font-size:10px;color:var(--text-muted);cursor:help" title="${(t.覆盖 || []).join('、')}">🔗${覆盖数}</span>` : '';
+      html += `<tr><td>• ${t.标题}</td><td>${覆盖标记}</td></tr>`;
+    });
     html += '</table></div>';
   }
   // 约束板块：始终显示，与右侧面板的约束板块保持一致（无约束时显示占位符）
@@ -3691,9 +3898,8 @@ window.实现纲要 = {
           throw new window.实现纲要APIError('❌ 添加测试失败：测试项必须提供非空字符串标题。当前值: ' + JSON.stringify(配置.标题) + '。请重新查看 API 文档。');
         }
 
-        if (!节点数据._测试项) 节点数据._测试项 = [];
-        节点数据._测试项.push({ 标题: 配置.标题 });
-        return 节点数据._测试项.length - 1;
+        // 多对多：创建独立测试项；默认覆盖调用者自身，可用 配置.覆盖 显式指定 0..N 个节点
+        return 创建测试项(配置.标题, 配置.覆盖 !== undefined ? 配置.覆盖 : [完整id]);
       },
 
       // ========== 关系便捷方法（v3 按类型分化） ==========
@@ -3927,6 +4133,8 @@ window.实现纲要 = {
       成员函数: Array.from(数据仓库.节点成员函数.entries()).map(([节点id, 函数列表]) => ({ 节点id, 函数列表 })),
       成员变量: Array.from(数据仓库.节点成员变量.entries()).map(([节点id, 变量列表]) => ({ 节点id, 变量列表 })),
       约束: Array.from(数据仓库.节点约束.entries()).map(([节点id, 约束列表]) => ({ 节点id, 约束列表 })),
+      // 全局测试项表（一对多：每条测试带 覆盖[] 节点列表）
+      测试项: 获取全部测试项(),
     };
     return 导出;
   },
@@ -4078,9 +4286,8 @@ window.实现纲要 = {
           throw new window.实现纲要APIError('❌ 添加测试失败：测试项必须提供非空字符串标题。当前值: ' + JSON.stringify(配置.标题) + '。请重新查看 API 文档。');
         }
 
-        if (!节点数据._测试项) 节点数据._测试项 = [];
-        节点数据._测试项.push({ 标题: 配置.标题 });
-        return 节点数据._测试项.length - 1;
+        // 多对多：创建独立测试项；默认覆盖调用者自身，可用 配置.覆盖 显式指定 0..N 个节点
+        return 创建测试项(配置.标题, 配置.覆盖 !== undefined ? 配置.覆盖 : [mfNodeId]);
       },
       添加约束(约束配置) {
         return window.实现纲要._添加约束(mfNodeId, 约束配置);
@@ -4217,9 +4424,8 @@ window.实现纲要 = {
           throw new window.实现纲要APIError('❌ 添加测试失败：测试项必须提供非空字符串标题。当前值: ' + JSON.stringify(配置.标题) + '。请重新查看 API 文档。');
         }
 
-        if (!节点数据._测试项) 节点数据._测试项 = [];
-        节点数据._测试项.push({ 标题: 配置.标题 });
-        return 节点数据._测试项.length - 1;
+        // 多对多：创建独立测试项；默认覆盖调用者自身，可用 配置.覆盖 显式指定 0..N 个节点
+        return 创建测试项(配置.标题, 配置.覆盖 !== undefined ? 配置.覆盖 : [mvNodeId]);
       },
       添加约束(约束配置) {
         return window.实现纲要._添加约束(mvNodeId, 约束配置);
@@ -4288,6 +4494,25 @@ window.实现纲要 = {
       throw new window.实现纲要APIError('添加约束失败：节点「' + 节点id + '」不存在。请重新查看 API 文档。');
     }
     return this._添加约束(节点id, ...args);
+  },
+
+  /**
+   * 添加测试项（多对多）：可依附 0 个、1 个或多个节点。
+   * 不传 覆盖 时创建"独立测试"（不依附任何节点）。
+   *
+   * @param {Object} 配置
+   * @param {string} 配置.标题 — 测试标题（必填）
+   * @param {string|string[]} [配置.覆盖] — 覆盖的节点 id（单个或数组；省略=不依附任何节点）
+   * @returns {string} 测试项 id
+   */
+  添加测试(配置) {
+    if (!配置 || typeof 配置 !== 'object') {
+      throw new window.实现纲要APIError('❌ 添加测试失败：配置参数不能为空。请重新查看 API 文档。');
+    }
+    if (!配置.标题 || typeof 配置.标题 !== 'string') {
+      throw new window.实现纲要APIError('❌ 添加测试失败：测试项必须提供非空字符串标题。当前值: ' + JSON.stringify(配置.标题) + '。请重新查看 API 文档。');
+    }
+    return 创建测试项(配置.标题, 配置.覆盖);
   },
 
   添加约定边(配置) {
@@ -4499,6 +4724,7 @@ window.实现纲要 = {
 
   /**
    * 导出全景图。AI 专用工具，导出所有节点/边/约束/功能的完整结构化 JSON。
+   * 测试项以一对多形式导出：每条测试带 覆盖[]（依附的节点列表，空数组 = 独立测试）。
    */
   导出全景图() {
     const 节点列表 = [];
@@ -4511,7 +4737,7 @@ window.实现纲要 = {
         置信度: node.置信度 || '中',
         对应需求: node.对应需求条目 ? [node.对应需求条目] : [],
         约束: 数据仓库.节点约束.get(id) || [],
-        测试项: node._测试项 || [],
+        测试项: 获取节点测试项(id).map(序列化测试项),
       };
       // Add member functions if available
       const 成员函数 = 数据仓库.节点成员函数.get(id);
@@ -4539,6 +4765,8 @@ window.实现纲要 = {
       节点: 节点列表,
       边: 边列表,
       分组: 分组列表,
+      // 全局测试项表（一对多：每条测试带 覆盖[] 节点列表；覆盖为空 = 独立测试）
+      测试项: 获取全部测试项(),
     };
   },
 
@@ -4546,6 +4774,7 @@ window.实现纲要 = {
    * 导出依赖与需求。为外部插件提供完整的依赖表 + 需求/责任/约束/测试/类型/函数/变量结构化 JSON。
    * 所有关系统一为依赖关系（拥有/继承/调用/符合约定等均视为依赖）。
    * 支持多项目递归：导出当前项目 + 所有依赖项目（含传递依赖），以子项目树形式嵌套。
+   * 测试项以一对多形式导出：每条测试带 覆盖[]；不依附节点的独立测试放在根级 独立测试 字段。
    */
   导出依赖与需求() {
     // === 1. 构建全局依赖表 + 节点依赖索引 + 项目间依赖关系 ===
@@ -4589,8 +4818,8 @@ window.实现纲要 = {
         对应需求: Array.isArray(映射.对应需求条目) ? 映射.对应需求条目 : (映射.对应需求条目 ? [映射.对应需求条目] : []),
       };
     };
-    const 取测试项 = (节点) =>
-      (节点?._测试项 || []).map(t => (typeof t === 'string' ? t : (t.标题 || '')));
+    const 取测试项 = (节点id) =>
+      获取节点测试项(节点id).map(序列化测试项);
     const 规范需求 = (条目) =>
       Array.isArray(条目) ? 条目 : (条目 ? [条目] : []);
 
@@ -4611,7 +4840,7 @@ window.实现纲要 = {
         const 分类 = 节点分类.get(id);
         const 责任 = 取责任(id);
         const 约束 = 数据仓库.节点约束.get(id) || [];
-        const 测试项 = 取测试项(节点);
+        const 测试项 = 取测试项(id);
         const 依赖 = 取依赖(id);
         const 功能拆解 = 节点._功能拆解 || [];
 
@@ -4637,7 +4866,7 @@ window.实现纲要 = {
                 签名: mf.签名 || mf.签名提示 || '',
                 对应需求: 规范需求(mf.对应需求条目),
                 约束: 数据仓库.节点约束.get(mfNodeId) || [],
-                测试项: 取测试项(数据仓库.节点.get(mfNodeId)),
+                测试项: 取测试项(mfNodeId),
                 依赖: 取依赖(mfNodeId),
               };
             });
@@ -4654,7 +4883,7 @@ window.实现纲要 = {
                 职责: mv.职责 || '',
                 对应需求: 规范需求(mv.对应需求条目),
                 约束: 数据仓库.节点约束.get(mvNodeId) || [],
-                测试项: 取测试项(数据仓库.节点.get(mvNodeId)),
+                测试项: 取测试项(mvNodeId),
                 依赖: 取依赖(mvNodeId),
               };
             });
@@ -4678,10 +4907,18 @@ window.实现纲要 = {
             置信度: 节点.置信度 || '中',
             类型名: 节点.类型名 || '',
             职责: 责任.职责, 对应需求: 责任.对应需求,
-            约束, 依赖,
+            约束, 测试项, 依赖,
           });
         }
         // 成员函数/成员变量节点：跳过（已在父类型的成员列表中导出）
+      }
+
+      // 该项目的测试项（覆盖到本项目任一节点的测试；跨项目测试会同时出现在各相关项目里）
+      const 该项目测试项 = [];
+      for (const t of 数据仓库.测试项.values()) {
+        if (t.覆盖 && t.覆盖.some(nid => (数据仓库.节点.get(nid) || {}).所属项目 === 项目名)) {
+          该项目测试项.push(序列化测试项(t));
+        }
       }
 
       // 该项目依赖了哪些外部项目
@@ -4700,15 +4937,18 @@ window.实现纲要 = {
         类型: 类型列表,
         函数: 函数列表,
         变量: 变量列表,
+        测试项: 该项目测试项,
         依赖表: 该项目依赖表,
         子项目: 子项目,
       };
     };
 
     // === 5. 从当前项目开始递归导出 ===
+    const 独立测试项 = 获取独立测试项().map(序列化测试项);
     const 结果 = 导出项目(当前项目名称 || '', new Set());
     if (结果) {
       结果.阶段 = 当前阶段 || '未设置';
+      结果.独立测试 = 独立测试项;
       return 结果;
     }
     // 当前项目无数据时的空返回
@@ -4717,7 +4957,9 @@ window.实现纲要 = {
       阶段: 当前阶段 || '未设置',
       依赖项目: [],
       类型: [], 函数: [], 变量: [],
+      测试项: [],
       依赖表: [],
+      独立测试: 独立测试项,
       子项目: {},
     };
   },
